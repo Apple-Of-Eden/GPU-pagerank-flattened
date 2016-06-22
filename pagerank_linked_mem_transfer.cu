@@ -3,25 +3,9 @@
 
 // For the CUDA runtime routines (prefixed with "cuda_")
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 
 
-typedef struct vertex vertex;
-
-struct vertex {
-    unsigned int vertex_id;
-    float pagerank;
-    float pagerank_next;
-    unsigned int n_successors;
-    vertex ** successors;
-};
-
-
-float abs_float(float in) {
-  if (in >= 0)
-    return in;
-  else
-    return -in;
-}
 
 __global__ void initializePagerankArray(float * pagerank_d, int n_vertices) {
     int i = (blockIdx.x * blockDim.x) + threadIdx.x;
@@ -141,22 +125,29 @@ __global__ void getConvergence(float * reduced_sums_d, float * diff) {
     *diff = reduced_sums_d[1023]; 
 }
 
-int main(void) {
+
+int main(int argc, char ** args) {
+    if (argc != 2) {
+	fprintf(stderr,"Wrong number of args. Provide input graph file.\n");
+        exit(-1);
+    } 
+
     // Error code to check return values for CUDA calls
     cudaFree(0);   // Set the cuda context here so that when we time, we're not including initial overhead
     cudaError_t err = cudaSuccess;
+    cudaProfilerStart();
     
     // Start CPU timer
-    clock_t start = clock(), diff;
+    clock_t cycles_to_build, cycles_to_calc;
+    clock_t start = clock();
+
 
 /*************************************************************************/
     // build up the graph
     int i;
     unsigned int n_vertices = 0;
     unsigned int n_edges = 0;
-    unsigned int vertex_from = 0, vertex_to = 0;
-
-    vertex * vertices;
+    unsigned int vertex_from = 0, vertex_to = 0, vertex_prev = 0;
     
     // Flattened data structure variables
     float * pagerank_h, *pagerank_d;
@@ -166,7 +157,7 @@ int main(void) {
     int * successor_offset_h, *successor_offset_d;
 
     FILE * fp;
-    if ((fp = fopen("testInput.txt", "r")) == NULL) {
+    if ((fp = fopen(args[1], "r")) == NULL) {
         fprintf(stderr,"ERROR: Could not open input file.\n");
         exit(-1);
     }
@@ -174,15 +165,16 @@ int main(void) {
     // parse input file to count the number of vertices
     // expected format: vertex_from vertex_to
     while (fscanf(fp, "%u %u", &vertex_from, &vertex_to) != EOF) {
-        if (vertex_from > n_vertices)
+        if (vertex_from > n_vertices) {
             n_vertices = vertex_from;
-        else if (vertex_to > n_vertices)
+	}
+        else if (vertex_to > n_vertices) {
             n_vertices = vertex_to;
+	}
+	n_edges++;
     }
     n_vertices++;
     
-    // Allocate memory for vertices on host and device
-    vertices = (vertex *) malloc(n_vertices * sizeof(vertex));
  
     // Allocate flattened data structure host and device memory
     pagerank_h = (float *) malloc(n_vertices * sizeof(*pagerank_h));
@@ -193,48 +185,43 @@ int main(void) {
     successor_offset_h = (int *) malloc(n_vertices * sizeof(*successor_offset_h));
     err = cudaMalloc((void **)&successor_offset_d, n_vertices*sizeof(int));
 
-    // SET Initial Parameters  **********************************************************
-    if (!vertices) {
-        fprintf(stderr,"Malloc failed for vertices.\n");
-        exit(-1);
-    }
-    memset((void *)vertices, 0, (size_t)(n_vertices*sizeof(vertex)));
-
-    // parse input file to count the number of successors of each vertex
-    fseek(fp, 0L, SEEK_SET);
-    while (fscanf(fp, "%u %u", &vertex_from, &vertex_to) != EOF) {
-        vertices[vertex_from].n_successors++;
-        n_successors_h[vertex_from] += 1;
-        n_edges++;
-    }
 
     // Allocate memory for contiguous successors_d data
     successors_h = (int *) malloc(n_edges * sizeof(*successors_h));
     err = cudaMalloc((void **)&successors_d, n_edges*sizeof(int));
 
     // allocate memory for successor pointers
-    int offset = 0;                                         // offset into the successors_h array
+    int offset = 0, edges = 0;                      // offset into the successors_h array
 
-    for (i=0; i<n_vertices; i++) {
-        successor_offset_h[i] = offset;
-    
-        if (vertices[i].n_successors > 0) {
-            offset += vertices[i].n_successors;
-        }
-        //else
-            // Flattened structure is basically a offset + 0 here
-    }
-
-    // parse input file to set up the successor pointers
-    int suc_index = 0;                                             // index into successors_h array
+    // parse input file to count the number of successors of each vertex
     fseek(fp, 0L, SEEK_SET);
-    while (fscanf(fp, "%d %d", &vertex_from, &vertex_to) != EOF) {
-        // Flattened data structure code to fill successors_h
-        successors_h[suc_index] = vertex_to;
-        suc_index++;            
+    i = 0;
+ 
+    while (fscanf(fp, "%u %u", &vertex_from, &vertex_to) != EOF) {
+        n_successors_h[vertex_from] += 1;
+	
+	// Fill successor_offset_h array
+        successor_offset_h[i] = offset;
+	if(edges != 0 && vertex_prev != vertex_from) {
+	    i = vertex_from;
+	    offset = edges;
+	    successor_offset_h[i] = offset;
+	   
+	    vertex_prev = vertex_from;
+	}
+
+	// Fill successor array
+	successors_h[edges] = vertex_to;
+	
+	edges++;
     }
+    successor_offset_h[i] = edges - 1;    
 
     fclose(fp);
+
+    // Get build time and reset start
+    cycles_to_build = clock() - start;
+    start = clock();
 
 /**************************************************************/
     // Transfer data structure to the GPU
@@ -243,6 +230,7 @@ int main(void) {
     err = cudaMemcpy(successor_offset_d, successor_offset_h, n_vertices*sizeof(int), cudaMemcpyHostToDevice);
 
 /*************************************************************************/
+    // Compute the pagerank
     int n_iterations = 30;
     int iteration = 0;
     int numOfBlocks = 1;                          // default example value for 1000 vertex graph
@@ -256,7 +244,6 @@ int main(void) {
         numOfBlocks = (n_vertices + 1023)/1024;   // The "+ 1023" ensures we round up
     }
 
-    // compute the pagerank on the GPU
     float dangling_value_h = 0;
     float dangling_value_h2 = 0;
     float *dangling_value2, *reduced_sums_d;
@@ -296,8 +283,8 @@ int main(void) {
         getConvergence<<<1,1024>>>(reduced_sums_d, d_diff);
         
         // Get difference to compare to epsilon
-        cudaMemcpy(&h_diff, d_diff, sizeof(float), cudaMemcpyDeviceToHost);
-        
+        cudaMemcpy(&h_diff, d_diff, sizeof(float), cudaMemcpyDeviceToHost);      
+
         // Make pagerank_d[i] = pagerank_next_d[i]
         setPagerankArrayFromNext<<<numOfBlocks,threadsPerBlock>>>(pagerank_d, pagerank_next_d, n_vertices);
         cudaDeviceSynchronize();
@@ -310,19 +297,19 @@ int main(void) {
     err = cudaMemcpy(pagerank_h, pagerank_d, n_vertices*sizeof(float), cudaMemcpyDeviceToHost);
 
     // Find CPU elapsed time
-    diff = clock() - start;
-    //printf("diff: %Lf\n", (long double)diff); 
+    cycles_to_calc = clock() - start;
     
     // Print time taken
-    int millisec = diff * 1000 / CLOCKS_PER_SEC;
-    printf("Time taken: %d milliseconds\n", millisec%1000);
+    int build_milli = cycles_to_build * 1000 / CLOCKS_PER_SEC;
+    int calc_milli = cycles_to_calc * 1000 / CLOCKS_PER_SEC;
  
     // Print pageranks
-    for(i = 0; i < n_vertices; i++) {
-        printf("i: %d, pr: %.6f\n",i, pagerank_h[i]);
-    }    
+   // for(i = 0; i < n_vertices; i++) {
+   //     printf("i: %d, pr: %.6f\n",i, pagerank_h[i]);
+   // }    
 
-    printf("Time taken: %d seconds, %d milliseconds\n",millisec/1000, millisec%1000);
+    printf("Time to build: %d seconds, %d milliseconds\n",build_milli/1000, build_milli%1000);
+    printf("Time to calc: %d seconds, %d milliseconds\n",calc_milli/1000, calc_milli%1000);
     printf("iter: %d\n", iteration);
 
 // Tests: ***************************
